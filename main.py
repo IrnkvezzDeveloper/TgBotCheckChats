@@ -43,6 +43,12 @@ class ManageCategory(StatesGroup):
 class ManageChats(StatesGroup):
     input_words = State()
 
+class AddAccountStates(StatesGroup):
+    receive_tdata = State()
+    receive_session = State()
+    input_number = State()
+    input_code = State()
+    input_2fa = State()
 
 #
 
@@ -59,7 +65,64 @@ class Keyboards:
             KeyboardButton(text='Аккаунты')
         )
         return kb
+        
+        
+@dp.message_handler(text='Аккаунты')
+async def on_accounts_selected(msg: types.Message, state: FSMContext):
+    prisma = Prisma()
+    await prisma.connect()
+    accounts_count = 0
+    accounts = await prisma.telegram_accounts.find_many()
+    if accounts is not None:
+        accounts_count = len(accounts)
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton(text="Добавить аккаунт", callback_data="manage-accounts_add"),
+        InlineKeyboardButton(text="Удалить аккаунт", callback_data="manage-accounts_remove")
+    )
+    await msg.answer(
+        f"Кол-во аккаунтов: {accounts_count}\n"
+        "Выберите действие",
+        reply_markup=kb
+    )
+    await prisma.disconnect()
 
+
+@dp.callback_query_handler(lambda c: c.data.split('_') == 'manage-accounts')
+async def on_accounts_manage_action(msg: types.CallbackQuery, state: FSMContext):
+    _, action = msg.data.split('_')
+    match action:
+        case 'add':
+            kb = InlineKeyboardMarkup()
+            kb.row(
+                InlineKeyboardButton(text="TData", callback_data='add-account_tdata'),
+                InlineKeyboardButton(text='По номеру телефона', callback_data='add-account_number')
+            )
+            kb.row(
+                InlineKeyboardButton(text="Telethon session", callback_data='add-account_session_telethon'),
+                InlineKeyboardButton(text="Pyrogram session", callback_data='add-account_session_pyrogram')
+            )
+            await msg.message.answer("Выберите способ добавления аккаунта", reply_markup=kb)
+        case 'remove':
+            ...
+
+@dp.callback_query_handler(lambda c: c.data.split("_")[0] == 'add-account')
+async def on_account_add_event(msg: types.CallbackQuery, state: FSMContext):
+    match msg.data.split('_')[1]:
+        case 'tdata':
+            await AddAccountStates.receive_tdata.set()
+            await msg.message.answer("Пришлите .zip архив хранящий в себе папку tdata")
+        case 'number':
+            ...
+        case 'session':
+            ...
+
+
+@dp.message_handler(content_type=types.ContentType.DOCUMENT, state=AddAccountStates.receive_tdata)
+async def on_tdata_received(msg: types.Message, state: FSMContext):
+    file = await msg.document()
+    _file = await bot.get_file(msg.document.file_id)
+    await _file.download(destination="./temp/")
 
 @dp.message_handler(text='Чаты')
 async def on_chats_button(msg: types.Message, state: FSMContext):
