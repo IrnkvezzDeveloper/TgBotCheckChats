@@ -1,60 +1,56 @@
-from pathlib import Path
 from prisma import Prisma
-from pyrogram import Client
-from aiogram import Bot
+from pyrogram import Client, types, dispatcher, idle
+from tools import get_client
 import asyncio
-import itertools
-from TGConvertor.manager.manager import SessionManager
+from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+import logging
 
 
-class Worker:
-    def __init__(self, bot):
-        self.chats = []
-        self.accounts = []
-        self.bot = bot
+logging.basicConfig(level=logging.INFO)
+notification_chat_id = 6629502994
+token = '6473395844:AAHgNJZVN2AHUaKgLlgWYf01yQC-nS8BID4'
+bot = Bot(token=token)
 
-    async def load_data(self):
-        prisma = Prisma()
-        await prisma.connect()
+
+async def main():
+    prisma = Prisma()
+    await prisma.connect()
+    client = await prisma.telegram_accounts.find_first()
+    py_cl: Client = get_client(client.number, client.session_str)
+    bot_id = await bot.get_me()
+
+    @py_cl.on_message()
+    async def on_message_received(cl_, msg: types.Message):
+        # await msg.forward(msg.chat.id)
         chats = await prisma.chats.find_many()
-        accounts = await prisma.telegram_accounts.find_many()
-        self.chats.extend(chats)
-        self.accounts.extend(accounts)
-        await prisma.disconnect()
+        ids = [i.id for i in chats]
+        if msg.from_user.id == bot_id.id:
+            return
+        if msg.chat.id in ids:
+            logging.info("Нашел чат в ID базы данных")
+            cur_chat = await prisma.chats.find_first(where={'id': msg.chat.id})
+            words = cur_chat.words.split(',')
+            logging.info(words)
 
-    @property
-    def get_chats_chunks(self):
-        return [self.chats[i:i + len(self.accounts)] for i in range(0, len(self.chats), len(self.accounts))]
-
-    def get_tasks(self):
-        chat_chunks = self.get_chats_chunks
-        ret_tasks = []
-        for idx, account in enumerate(self.accounts):
-            worker = AccountWorker(
-                Client(
-                    account.get('number'),
-                    api_id=6,
-                    api_hash="eb06d4abfb49dc3eeb1aeb98ae0f581e",
-                    device_model="Samsung SM-G998B",
-                    system_version="SDK 31",
-                    app_version="8.4.1 (2522)",
-                    lang_code="en",
-                    session_string=account.get("session_str")
-                ),
-                chat_chunks[idx],
-                self.bot
-            )
-            ret_tasks.append(
-                asyncio.create_task(worker.create_work())
-            )
-        return ret_tasks
+            for word in words:
+                if msg.text.find(word) != -1:
+                    logging.info("Нашел СЛОВО")
+                    kb = InlineKeyboardMarkup()
+                    kb.add(InlineKeyboardButton(text='Проверено?', callback_data='check-msg_answered'))
+                    await bot.send_message(
+                        notification_chat_id,  # TEMP !!!!
+                        f"Найдено ключевое слово: {word}!\n\n"
+                        f"{msg.text}\n"
+                        f"От пользователя @{msg.from_user.username}\n\n"
+                        f"Link -> {cur_chat.invite_link}",
+                        reply_markup=kb
+                    )
+                    continue
+    async with py_cl:
+        await idle()
+    await prisma.disconnect()
 
 
-class AccountWorker:
-    def __init__(self, account: Client, chats: list, bot: Bot):
-        self.account: Client = account
-        self.chats = chats
-        self.bot = Bot
-
-    async def create_work(self):
-        ...
+if __name__ == '__main__':
+    asyncio.run(main())

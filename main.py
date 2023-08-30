@@ -1,27 +1,30 @@
 import asyncio
+import os
 import signal
+from pathlib import Path
+from zipfile import ZipFile
 
+import pyrogram.types
 from pyrogram.types import Chat
 
 import tools
 from prisma import Prisma
-from account_worker import Worker
+from TGConvertor.manager.manager import SessionManager
 
 from aiogram.dispatcher import FSMContext
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.dispatcher.filters.state import State, StatesGroup
-
+from subprocess import Popen
 from pyrogram import Client
 
 bot = Bot(
-    '6473395844:AAHgNJZVN2AHUaKgLlgWYf01yQC-nS8BID4',
-    parse_mode=types.ParseMode.MARKDOWN_V2
+    '6473395844:AAHgNJZVN2AHUaKgLlgWYf01yQC-nS8BID4'
 )
 dp = Dispatcher(bot, storage=MemoryStorage())
-worker = Worker(bot)
 
+checking_process = []
 
 # STATES
 
@@ -66,7 +69,13 @@ class Keyboards:
         )
         return kb
         
-        
+
+@dp.message_handler(commands=['start'], state='*')
+async def on_start_cmd(msg: types.Message, state: FSMContext):
+    await state.finish()
+    await msg.answer("Приветики", reply_markup=Keyboards.get_main_menu_kb())
+
+
 @dp.message_handler(text='Аккаунты')
 async def on_accounts_selected(msg: types.Message, state: FSMContext):
     prisma = Prisma()
@@ -77,8 +86,8 @@ async def on_accounts_selected(msg: types.Message, state: FSMContext):
         accounts_count = len(accounts)
     kb = InlineKeyboardMarkup()
     kb.row(
-        InlineKeyboardButton(text="Добавить аккаунт", callback_data="manage-accounts_add"),
-        InlineKeyboardButton(text="Удалить аккаунт", callback_data="manage-accounts_remove")
+        InlineKeyboardButton(text="Добавить аккаунт", callback_data="manage-accounts_add")
+        # InlineKeyboardButton(text="Удалить аккаунт", callback_data="manage-accounts_remove")
     )
     await msg.answer(
         f"Кол-во аккаунтов: {accounts_count}\n"
@@ -87,8 +96,15 @@ async def on_accounts_selected(msg: types.Message, state: FSMContext):
     )
     await prisma.disconnect()
 
+@dp.callback_query_handler(text='check-msg_answered')
+async def on_msg_checked_answered(msg: types.CallbackQuery):
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton(text="✅", callback_data='_')
+    )
+    await msg.message.edit_reply_markup(kb)
 
-@dp.callback_query_handler(lambda c: c.data.split('_') == 'manage-accounts')
+@dp.callback_query_handler(lambda c: c.data.split('_')[0] == 'manage-accounts')
 async def on_accounts_manage_action(msg: types.CallbackQuery, state: FSMContext):
     _, action = msg.data.split('_')
     match action:
@@ -98,10 +114,10 @@ async def on_accounts_manage_action(msg: types.CallbackQuery, state: FSMContext)
                 InlineKeyboardButton(text="TData", callback_data='add-account_tdata'),
                 InlineKeyboardButton(text='По номеру телефона', callback_data='add-account_number')
             )
-            kb.row(
-                InlineKeyboardButton(text="Telethon session", callback_data='add-account_session_telethon'),
-                InlineKeyboardButton(text="Pyrogram session", callback_data='add-account_session_pyrogram')
-            )
+            # kb.row(
+            #     InlineKeyboardButton(text="Telethon session", callback_data='add-account_session_telethon'),
+            #     InlineKeyboardButton(text="Pyrogram session", callback_data='add-account_session_pyrogram')
+            # )
             await msg.message.answer("Выберите способ добавления аккаунта", reply_markup=kb)
         case 'remove':
             ...
@@ -113,29 +129,91 @@ async def on_account_add_event(msg: types.CallbackQuery, state: FSMContext):
             await AddAccountStates.receive_tdata.set()
             await msg.message.answer("Пришлите .zip архив хранящий в себе папку tdata")
         case 'number':
-            ...
+            await AddAccountStates.input_number.set()
+            await msg.message.answer("Пожалуйста, введите номер телефона")
         case 'session':
             ...
 
+@dp.message_handler(state=AddAccountStates.input_number)
+async def on_number_received(msg: types.Message, state: FSMContext):
+    cl = tools.get_client(msg.text, None)
+    await cl.connect()
+    sent: pyrogram.types.SentCode = await cl.send_code(msg.text)
+    await state.update_data({'number': msg.text, 'cl': cl, 'hash': sent.phone_code_hash})
+    await msg.answer("Введите код который пришел вам от администратора телеграм")
+    await AddAccountStates.input_code.set()
 
-@dp.message_handler(content_type=types.ContentType.DOCUMENT, state=AddAccountStates.receive_tdata)
+@dp.message_handler(state=AddAccountStates.input_code)
+async def on_code_received(msg: types.Message, state: FSMContext):
+    data = await state.get_data()
+    cl: Client = data.get('cl')
+    hash = data.get('hash')
+    number = data.get('number')
+    try:
+        await cl.sign_in(number, hash, msg.text)
+        me = await cl.get_me()
+        await msg.answer(f"Аккаунт @{me.username} успешно добавлен")
+        sess_str = tools.to_string(cl)
+        prisma = Prisma()
+        await prisma.connect()
+        await prisma.telegram_accounts.create({
+            'number': number,
+            'session_str': sess_str
+        })
+        await prisma.disconnect()
+    except Exception as ex:
+        print(ex)
+        await msg.answer("Код не верный, повторите попытку")
+
+
+
+
+@dp.message_handler(content_types=types.ContentTypes.DOCUMENT, state=AddAccountStates.receive_tdata)
 async def on_tdata_received(msg: types.Message, state: FSMContext):
-    file = await msg.document()
-    _file = await bot.get_file(msg.document.file_id)
-    await _file.download(destination="./temp/")
+    try:
+        await msg.document.download(destination='./temp/data.zip')
+        with ZipFile('./temp/data.zip', 'r') as fp:
+            fp.extractall('./temp/tdatas/')
+        sess = SessionManager.from_tdata_folder(Path('./temp/tdatas/tdata/'))
+        session_str = sess.to_pyrogram_string()
+        cl = tools.get_client('temp', session_str)
+        await cl.connect()
+        bot_me = await cl.get_me()
+        number = bot_me.phone_number
+        username = bot_me.username
+        await msg.answer(f"Бот @{username} успешно добавлен")
+        await state.finish()
+        prisma = Prisma()
+        await prisma.connect()
+        await prisma.telegram_accounts.create(data={
+            "number": number.split('+')[-1],
+            "session_str": session_str
+        })
+        await prisma.disconnect()
+    except Exception as ex:
+        await msg.answer("Tdata является не рабочей. Пришлите другой архив")
+        print(ex)
+    finally:
+        os.remove('./temp/data.zip')
+        os.system('rm -r temp')
+
 
 @dp.message_handler(text='Чаты')
 async def on_chats_button(msg: types.Message, state: FSMContext):
     prisma = Prisma()
     await prisma.connect()
+    account = await prisma.telegram_accounts.find_first()
     chats = await prisma.chats.find_many()
     await prisma.disconnect()
     kb = InlineKeyboardMarkup()
+    _acc: Client = tools.get_client(account.number, account.session_str)
+    await _acc.connect()
     for chat in chats:
+        _chat = await _acc.get_chat(chat.id)
         kb.insert(
             InlineKeyboardButton(
-                text=chat.get("name"),
-                callback_data=f"selected-chat_{chat.get('id')}")
+                text=str(_chat.title),
+                callback_data=f"selected-chat_{chat.id}")
         )
     kb.add(
         InlineKeyboardButton(
@@ -168,13 +246,6 @@ async def on_categories_button(msg: types.Message, state: FSMContext):
         text="Выберите категорию или создайте новую",
         reply_markup=kb
     )
-
-
-@dp.message_handler(commands=['test'])
-async def test_cmd(msg: types.Message):
-    ret = await worker.load_data()
-    print(type(ret))
-    print(ret)
 
 
 @dp.callback_query_handler(lambda c: c.data.split('_')[0] == 'select-category')
@@ -323,18 +394,19 @@ async def on_chat_action(msg: types.CallbackQuery, state: FSMContext):
         await msg.message.answer("Пожалуйста, введите ссылку на чат")
         await NewChatStates.input_link.set()
     else:
-        if data.isdigit():
+        if True:
             prisma = Prisma()
             await prisma.connect()
             rand_cl = await prisma.telegram_accounts.find_first()
-            _chat = await prisma.chats.find_first(where={'id': data})
+            _chat = await prisma.chats.find_first(where={'id': int(data)})
             await prisma.disconnect()
             if rand_cl is None:
                 await msg.message.answer("Добавьте хотя бы один телеграм аккаунт")
                 await state.finish()
                 return
             client = tools.get_client(rand_cl.number, rand_cl.session_str)
-            chat = await client.get_chat(data)
+            await client.connect()
+            chat = await client.get_chat(_chat.id)
             words = 'Не найдено'
             if _chat.words is not None:
                 words = len(_chat.words.split(','))
@@ -343,7 +415,7 @@ async def on_chat_action(msg: types.CallbackQuery, state: FSMContext):
                 InlineKeyboardButton(text='Удалить чат', callback_data='manage-chats_remove'),
                 InlineKeyboardButton(text='Ключевые слова', callback_data='manage-chats_words')
             )
-            await state.update_data({'chat_id': data})
+            await state.update_data({'chat_id': _chat.id})
             await msg.message.answer(
                 f"Название чата: {chat.title}\n"
                 f"Ключевых слов: {words}",
@@ -360,7 +432,7 @@ async def on_chats_manage_action(msg: types.CallbackQuery, state: FSMContext):
         case 'remove':
             prisma = Prisma()
             await prisma.connect()
-            await prisma.chats.delete(where={'id': data.get('chat_id')})
+            await prisma.chats.delete(where={'id': int(data.get('chat_id'))})
             await prisma.disconnect()
             await msg.message.answer("Чат был успешно удален", reply_markup=Keyboards.get_main_menu_kb())
             await state.finish()
@@ -415,7 +487,7 @@ async def on_words_inputted(msg: types.Message, state: FSMContext):
 
 @dp.message_handler(state=NewChatStates.input_link)
 async def on_chat_link_received(msg: types.Message, state: FSMContext):
-    if msg.text.startswith("https://t.me/joinchat") or msg.text.startswith("@"):
+    if msg.text.startswith("https://t.me/") or msg.text.startswith("@"):
         prisma = Prisma()
         await prisma.connect()
         random_client = await prisma.telegram_accounts.find_first()
@@ -426,6 +498,7 @@ async def on_chat_link_received(msg: types.Message, state: FSMContext):
             return
         rand_cl: Client = tools.get_client(random_client.number, random_client.session_str)
         try:
+            await rand_cl.connect()
             chat: Chat = await rand_cl.join_chat(msg.text)
             await state.update_data({
                 'chat_id': chat.id,
@@ -436,6 +509,7 @@ async def on_chat_link_received(msg: types.Message, state: FSMContext):
             categories = await prisma.categories.find_many()
             await prisma.disconnect()
             kb = InlineKeyboardMarkup()
+            await state.update_data({'invite_link': msg.text})
             for category in categories:
                 kb.insert(InlineKeyboardButton(text=category.name, callback_data=f'link-chat_{category.id}'))
             await msg.answer("Пожалуйста, выберите категорию, к которой привязать данный чат", reply_markup=kb)
@@ -449,7 +523,7 @@ async def on_chat_link_received(msg: types.Message, state: FSMContext):
 @dp.callback_query_handler(lambda c: c.data.split('_')[0] == 'link-chat', state=NewChatStates.select_category)
 async def on_category_linked(msg: types.CallbackQuery, state: FSMContext):
     _, category_id = msg.data.split('_')
-    await state.update_data({'category_id': category_id})
+    await state.update_data({'category_id': int(category_id)})
     await NewChatStates.input_words.set()
     await msg.message.answer("Пожалуйста, введите ключевые слова для чата, перечисляя их через запятую.\n\n"
                              "Пример: забота,прибыль,магия")
@@ -464,6 +538,7 @@ async def on_chat_words_received(msg: types.Message, state: FSMContext):
     await prisma.chats.create({
         'id': data.get('chat_id'),
         'category_id': data.get('category_id'),
+        "invite_link": data.get("invite_link"),
         'words': ','.join(words)
     })
     await prisma.disconnect()
@@ -483,21 +558,22 @@ async def new_category_name(msg: types.Message, state: FSMContext):
     await state.finish()
 
 
-@dp.message_handler(commands=['start'])
-async def on_start_cmd(msg: types.Message, state: FSMContext):
-    await msg.answer("Приветики", reply_markup=Keyboards.get_main_menu_kb())
+
 
 
 def on_exit_callback(signal_code, frame):
     print("Program was finished with code ", signal_code)
+    for i in checking_process:
+        i.kill()
     print("BY InfinityTeam")
     exit(0)
 
 
 async def on_start_callback():
+    env = os.environ
+    checking_process.append( Popen(['python', 'account_worker.py'], cwd=os.getcwd(), env=env) )
     actions = [
         asyncio.create_task(dp.start_polling(relax=0.05)),
-        # asyncio.create_task(worker.polling()),
     ]
     await asyncio.wait(actions)
 

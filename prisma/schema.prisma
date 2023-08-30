@@ -13,18 +13,20 @@ model categories {
   id    Int     @id @default(autoincrement())
   name  String?
   words String?
-  chats chats[]
+  chats chats[] @ignore
 }
 
+/// The underlying table does not contain a valid unique identifier and can therefore currently not be handled by Prisma Client.
 model chats {
-  id          Int         @id @default(autoincrement())
+  id          Int @id @default(autoincrement())
   category_id Int?
   words       String?
+  invite_link String?
   categories  categories? @relation(fields: [category_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
 }
 
 model telegram_accounts {
   id          Int     @id @default(autoincrement())
-  number      Int?
+  number      String?
   session_str String?
 }
